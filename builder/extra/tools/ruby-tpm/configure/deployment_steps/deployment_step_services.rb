@@ -2,7 +2,8 @@ module ConfigureDeploymentStepServices
   def get_methods
     [
       ConfigureCommitmentMethod.new("set_maintenance_policy", ConfigureDeploymentStepMethod::FIRST_GROUP_ID, ConfigureDeploymentStepMethod::FIRST_STEP_WEIGHT),
-      ConfigureCommitmentMethod.new("stop_replication_services", -1, 0),
+      ConfigureCommitmentMethod.new("stop_disabled_services", -1, 0),
+      ConfigureCommitmentMethod.new("stop_replication_services", -1, 1),
       ConfigureDeploymentMethod.new("apply_config_services", 0, ConfigureDeploymentStepMethod::FINAL_STEP_WEIGHT),
       ConfigureCommitmentMethod.new("update_metadata", 1, 0),
       ConfigureCommitmentMethod.new("deploy_services", 1, 1),
@@ -22,11 +23,39 @@ module ConfigureDeploymentStepServices
     Configurator.instance.write_header "Performing services configuration"
 
     config_wrapper()
+  end
+  
+  # Stop services that are running but have been disabled by
+  # a configuration update
+  def stop_disabled_services
+    # If this value is empty there is no previous configuration
+    if get_additional_property(ACTIVE_DIRECTORY_PATH) == nil
+      return
+    end
     
-    write_deployall()
-    write_undeployall()
-    write_startall()
-    write_stopall()
+    unless is_connector?()
+      _disable_component(get_additional_property(ACTIVE_DIRECTORY_PATH), "connector")
+    end
+    
+    unless is_replicator?()
+      _disable_component(get_additional_property(ACTIVE_DIRECTORY_PATH), "replicator")
+    end
+    
+    unless is_manager?()
+      _disable_component(get_additional_property(ACTIVE_DIRECTORY_PATH), "manager")
+    end
+  end
+  
+  def _disable_component(root, name)
+    cmd = "#{root}/tungsten-#{name}/bin/#{name}"
+    if Configurator.instance.svc_is_running?(cmd)
+      cmd_result(cmd + " stop", true)
+    end
+    
+    wrapper = "#{root}/tungsten-#{name}/conf/wrapper.conf"
+    if File.exist?(wrapper)
+      FileUtils.rm_f(wrapper)
+    end
   end
   
   def deploy_services
@@ -65,7 +94,19 @@ module ConfigureDeploymentStepServices
           if get_additional_property(RECONFIGURE_CONNECTORS_ALLOWED) == true
             # We are updating the existing directory so `connector reconfigure` can be used
             info("Tell the connector to update its configuration")
-            info(cmd_result("#{@config.getProperty(CURRENT_RELEASE_DIRECTORY)}/tungsten-connector/bin/connector reconfigure"))
+            begin
+              Timeout.timeout(10) {
+                info(cmd_result("#{@config.getProperty(CURRENT_RELEASE_DIRECTORY)}/tungsten-connector/bin/connector reconfigure"))
+              }
+            rescue Timeout::Error
+              # The reconfigure command took too long so we must stop and start the connector
+              begin
+                info(cmd_result("#{@config.getProperty(CURRENT_RELEASE_DIRECTORY)}/tungsten-connector/bin/connector graceful-stop 30"))
+              ensure
+                sleep(1)
+                info(cmd_result("#{@config.getProperty(CURRENT_RELEASE_DIRECTORY)}/tungsten-connector/bin/connector start"))
+              end
+            end
           else
             # Stop the connector and start it again so that the full configuration, including ports, are reloaded
             begin
@@ -271,6 +312,38 @@ module ConfigureDeploymentStepServices
           else
             cmd_result("mv #{current_data} #{target_data}")
           end
+        end
+        
+        if Configurator.instance.is_enterprise?
+          @config.getProperty([REPL_SERVICES]).keys().each{
+            |rs_alias|
+            if rs_alias == DEFAULTS
+              next
+            end
+
+            begin
+              key = "repl_services.#{rs_alias}.repl_svc_schema"
+              
+              schema = @config.getProperty(key)
+              result_json = cmd_result("#{get_additional_property(ACTIVE_DIRECTORY_PATH)}/tools/tpm query values #{key}", true)
+              result = JSON.parse(result_json)
+              
+              if result[key] != schema
+                # Migrate information to the new schema
+                Configurator.instance.debug("Migrate metadata from #{result[key]} to #{schema}")
+                
+                f = Tempfile.new("tpmmigrate")
+                cmd_result("echo \"SET SESSION SQL_LOG_BIN=0;\n\" >> #{f.path()}")
+                cmd_result("echo \"CREATE SCHEMA \\`#{schema}\\`;\n\" >> #{f.path()}")
+                cmd_result("echo \"USE '#{schema}';\n\" >> #{f.path()}")
+                
+                cmd = "mysqldump --defaults-file=#{@config.getProperty([REPL_SERVICES, rs_alias, REPL_MYSQL_SERVICE_CONF])} --host=#{@config.getProperty([REPL_SERVICES, rs_alias, REPL_DBHOST])} --port=#{@config.getProperty([REPL_SERVICES, rs_alias, REPL_DBPORT])}"
+                cmd_result("#{cmd} --opt --single-transaction #{result[key]} >> #{f.path()}")
+                cmd_result("cat #{f.path()} | mysql --defaults-file=#{@config.getProperty([REPL_SERVICES, rs_alias, REPL_MYSQL_SERVICE_CONF])}")
+              end
+            rescue
+            end
+          }
         end
       end
     end
